@@ -433,9 +433,9 @@ class HTML5Renderer:
         
         try:
             # Setup the document title
-            title_element = document.get_element_by_tag_name('title')
-            if title_element and hasattr(title_element, 'text_content'):
-                title = title_element.text_content
+            title_elements = document.get_elements_by_tag_name('title')
+            if title_elements and len(title_elements) > 0 and hasattr(title_elements[0], 'text_content'):
+                title = title_elements[0].text_content
                 # Update the window title if we can
                 try:
                     self.parent.master.title(f"{title} - Wink Browser")

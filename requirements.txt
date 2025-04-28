@@ -9,6 +9,7 @@ certifi>=2023.7.22  # For SSL certificate validation
 urllib3>=2.0.7,<3.0  # Updated for better HTTPS support
 html2text>=2020.1.16  # For HTML to Markdown conversion
 markdown>=3.4.3  # For Markdown to HTML conversion
+cairosvg>=2.7.1  # For SVG rendering support
 
 # UI dependencies
 # Note: Tkinter comes with Python installation, not via pip
