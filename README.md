@@ -125,7 +125,7 @@ To create example extensions, run:
 python -m browser_engine.extensions.setup_extensions
 ```
 
-## Comparing and contrasting Wink to TempleOS
+## Comparing and contrasting Wink to TempleOS (for the lols)
 
 ***TempleOS and wink have a few similarities...***
 
