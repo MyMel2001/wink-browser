@@ -28,15 +28,98 @@ cssutils.log.setLevel(logging.CRITICAL)
 
 logger = logging.getLogger(__name__)
 
+
+class Tab:
+    """
+    Represents a single browser tab with its own state.
+
+    Each tab maintains its own:
+    - Navigation history
+    - Current URL
+    - Page title
+    - Document state
+    - Loading state
+    """
+
+    def __init__(self, tab_id: int):
+        """
+        Initialize a new tab.
+
+        Args:
+            tab_id: Unique identifier for this tab
+        """
+        self.tab_id = tab_id
+        self.url = None
+        self.title = None
+        self.history = []
+        self.history_index = -1
+        self.is_loading = False
+        self.document = None
+        self.layout_tree = None
+        self.favicon = None
+
+        # UI elements (set later)
+        self.frame = None
+        self.label = None
+        self.frame_id = None
+
+    def add_to_history(self, url: str) -> None:
+        """
+        Add a URL to the tab's history.
+
+        Args:
+            url: URL to add to history
+        """
+        # Remove any forward history if we navigated after going back
+        if self.history_index < len(self.history) - 1:
+            self.history = self.history[:self.history_index + 1]
+
+        self.history.append(url)
+        self.history_index = len(self.history) - 1
+
+    def go_back(self) -> Optional[str]:
+        """
+        Navigate back in history.
+
+        Returns:
+            The previous URL, or None if can't go back
+        """
+        if self.history_index > 0:
+            self.history_index -= 1
+            return self.history[self.history_index]
+        return None
+
+    def go_forward(self) -> Optional[str]:
+        """
+        Navigate forward in history.
+
+        Returns:
+            The next URL, or None if can't go forward
+        """
+        if self.history_index < len(self.history) - 1:
+            self.history_index += 1
+            return self.history[self.history_index]
+        return None
+
+    def can_go_back(self) -> bool:
+        """Check if can navigate back."""
+        return self.history_index > 0
+
+    def can_go_forward(self) -> bool:
+        """Check if can navigate forward."""
+        return self.history_index < len(self.history) - 1
+
+
 class BrowserWindow:
-    """Main browser window implementation."""
-    
-    def __init__(self, root, network_manager, ad_blocker, 
+    """Main browser window implementation with tab support."""
+
+    def __init__(self, root, network_manager, ad_blocker,
                  extension_manager, profile_manager, config_manager,
+                 html5_engine=None,
                  disable_javascript=False, private_mode=False, debug_mode=False):
         """
         Initialize the browser window.
-        
+
         Args:
             root: The root Tk window
             network_manager: Network request manager
@@ -44,6 +127,7 @@ class BrowserWindow:
             extension_manager: Browser extension manager
             profile_manager: User profile manager
             config_manager: Browser configuration manager
+            html5_engine: HTML5 rendering engine (optional, will be created if not provided)
             disable_javascript: Whether to disable JavaScript
             private_mode: Whether to use private browsing mode
             debug_mode: Whether to enable debug logging
@@ -57,38 +141,51 @@ class BrowserWindow:
         self.disable_javascript = disable_javascript
         self.private_mode = private_mode
         self.debug_mode = debug_mode
-        
-        # Browser state
+
+        # Initialize HTML5 engine if not provided
+        if html5_engine is None:
+            # Create a default HTML5 engine with window dimensions
+            window_width = root.winfo_width() or 1024
+            window_height = root.winfo_height() or 768
+            self.html5_engine = HTML5Engine(
+                width=window_width,
+                height=window_height,
+                debug=debug_mode
+            )
+        else:
+            self.html5_engine = html5_engine
+
+        # Tab management
+        self.tabs = {}  # tab_id -> Tab object
+        self.tab_counter = 0
+        self.active_tab_id = None
+
+        # Content cache
+        self.content_cache = {}
+
+        # Navigation state (global - for backward compatibility)
+        self.current_url = None
         self.history = []
         self.current_history_index = -1
         self.is_loading = False
-        self.current_url = None
-        self.content_cache = {}
-        
-        # Initialize the HTML5 rendering engine
-        self.html5_engine = HTML5Engine(
-            width=self.root.winfo_width(), 
-            height=self.root.winfo_height(), 
-            debug=self.debug_mode
-        )
-        
-        # Register for loading state changes
-        self.html5_engine.on_load(self._on_page_loaded)
-        self.html5_engine.on_error(self._on_page_error)
-        
+
         # Set up icons and theme
         self._setup_theme()
-        
+
         # Create UI components
         self._create_menu()
+        self._create_tab_bar()
         self._create_toolbar()
         self._create_statusbar()
         self._create_content_area()
-        
+
         # Bind keyboard shortcuts
         self._bind_shortcuts()
-        
-        logger.info("Browser window initialized")
+
+        # Create initial tab
+        self._create_new_tab()
+
+        logger.info("Browser window initialized with tab support")
     
     def _setup_theme(self) -> None:
         """Set up the browser theme and icons."""
@@ -96,20 +193,278 @@ class BrowserWindow:
         try:
             self.style = ttk.Style()
             available_themes = self.style.theme_names()
-            
+
             preferred_themes = ['clam', 'alt', 'default']
             for theme in preferred_themes:
                 if theme in available_themes:
                     self.style.theme_use(theme)
                     break
-            
+
             # Configure colors
             self.style.configure('TFrame', background='#f0f0f0')
             self.style.configure('TButton', background='#e0e0e0')
             self.style.configure('TEntry', fieldbackground='white')
-            
+
+            # Tab-specific styles
+            self.style.configure(
+                'Tab.TLabel',
+                background='#e0e0e0',
+                foreground='#333333',
+                padding=(10, 5, 10, 5),
+                font=('Segoe UI', 9)
+            )
+            self.style.configure(
+                'Active.Tab.TLabel',
+                background='white',
+                foreground='#000000',
+                padding=(10, 5, 10, 5),
+                font=('Segoe UI', 9, 'bold')
+            )
+            self.style.configure(
+                'TabClose.TButton',
+                background='#e0e0e0',
+                padding=(2, 0, 2, 0),
+                font=('Segoe UI', 8)
+            )
+            self.style.configure(
+                'NewTab.TButton',
+                padding=(5, 2, 5, 2),
+                font=('Segoe UI', 10, 'bold')
+            )
+
         except Exception as e:
             logger.warning(f"Error setting up theme: {e}")
+
+    def _create_tab_bar(self) -> None:
+        """Create the tab bar for managing multiple tabs."""
+        # Tab bar container
+        self.tab_bar_frame = ttk.Frame(self.root, style='TFrame')
+        self.tab_bar_frame.pack(side=tk.TOP, fill=tk.X, padx=2, pady=(2, 0))
+
+        # Tab container (holds individual tabs)
+        self.tab_container = ttk.Frame(self.tab_bar_frame)
+        self.tab_container.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # New tab button
+        self.new_tab_button = ttk.Button(
+            self.tab_bar_frame,
+            text="+",
+            style='NewTab.TButton',
+            width=3,
+            command=self._create_new_tab
+        )
+        self.new_tab_button.pack(side=tk.RIGHT, padx=2)
+
+    def _create_new_tab(self, url: str = None) -> int:
+        """
+        Create a new browser tab.
+
+        Args:
+            url: Optional URL to load in the new tab
+
+        Returns:
+            The ID of the created tab
+        """
+        self.tab_counter += 1
+        tab_id = self.tab_counter
+
+        # Create tab object to store state
+        tab = Tab(tab_id)
+        self.tabs[tab_id] = tab
+
+        # Create tab UI element
+        tab_frame = ttk.Frame(self.tab_container)
+
+        # Tab label (shows page title or URL)
+        tab_label = ttk.Label(
+            tab_frame,
+            text="New Tab",
+            style='Tab.TLabel',
+            cursor='hand2'
+        )
+        tab_label.pack(side=tk.LEFT)
+        tab_label.bind('<Button-1>', lambda e, tid=tab_id: self._switch_to_tab(tid))
+
+        # Close button
+        close_button = ttk.Button(
+            tab_frame,
+            text="×",
+            style='TabClose.TButton',
+            width=2,
+            command=lambda tid=tab_id: self._close_tab(tid)
+        )
+        close_button.pack(side=tk.LEFT, padx=(2, 0))
+
+        tab_frame.pack(side=tk.LEFT, padx=1)
+        tab.frame = tab_frame
+        tab.label = tab_label
+
+        # Store reference to tab frame
+        tab.frame_id = str(tab_id)
+
+        # Switch to the new tab
+        self._switch_to_tab(tab_id)
+
+        # Load URL if provided
+        if url:
+            self._load_url_in_tab(tab_id, url)
+
+        return tab_id
+
+    def _switch_to_tab(self, tab_id: int) -> None:
+        """
+        Switch to a specific tab.
+
+        Args:
+            tab_id: The ID of the tab to switch to
+        """
+        if tab_id not in self.tabs:
+            return
+
+        # Update previous tab's appearance
+        if self.active_tab_id is not None and self.active_tab_id in self.tabs:
+            old_tab = self.tabs[self.active_tab_id]
+            if hasattr(old_tab, 'label') and old_tab.label:
+                old_tab.label.configure(style='Tab.TLabel')
+
+        # Set new active tab
+        self.active_tab_id = tab_id
+        tab = self.tabs[tab_id]
+
+        # Update tab appearance
+        if hasattr(tab, 'label') and tab.label:
+            tab.label.configure(style='Active.Tab.TLabel')
+
+        # Update UI to reflect tab state
+        self._update_ui_from_tab(tab)
+
+        # Update content area
+        self._render_tab_content(tab)
+
+    def _update_ui_from_tab(self, tab) -> None:
+        """Update the URL bar and other UI elements from tab state."""
+        # Update URL bar
+        if hasattr(tab, 'url') and tab.url:
+            self.url_var.set(tab.url)
+            self._current_url_for_display = tab.url
+        else:
+            self.url_var.set("")
+            self._current_url_for_display = ""
+
+        # Update navigation buttons
+        self._update_navigation_state_for_tab(tab)
+
+        # Update status
+        if tab.is_loading:
+            self.status_label.config(text="Loading...")
+            self.refresh_button.config(text="✕")
+        else:
+            self.status_label.config(text="Ready")
+            self.refresh_button.config(text="⟳")
+
+        # Update title
+        if hasattr(tab, 'title') and tab.title:
+            self.root.title(f"{tab.title} - Wink Browser")
+        else:
+            self.root.title("Wink Browser")
+
+    def _update_navigation_state_for_tab(self, tab) -> None:
+        """Update navigation buttons based on tab history state."""
+        # Update back button
+        if hasattr(tab, 'history_index') and tab.history_index > 0:
+            self.back_button.state(['!disabled'])
+        else:
+            self.back_button.state(['disabled'])
+
+        # Update forward button
+        if hasattr(tab, 'history') and tab.history_index < len(tab.history) - 1:
+            self.forward_button.state(['!disabled'])
+        else:
+            self.forward_button.state(['disabled'])
+
+    def _render_tab_content(self, tab) -> None:
+        """Render the content for a specific tab."""
+        if hasattr(tab, 'document') and tab.document:
+            # We have cached content, render it
+            self.html5_engine.document = tab.document
+            if hasattr(tab, 'layout_tree') and tab.layout_tree:
+                self.html5_engine.layout_tree = tab.layout_tree
+            self._update_renderer()
+        else:
+            # No content, show blank or load URL
+            pass
+
+    def _close_tab(self, tab_id: int) -> None:
+        """
+        Close a specific tab.
+
+        Args:
+            tab_id: The ID of the tab to close
+        """
+        if tab_id not in self.tabs:
+            return
+
+        # Remove tab UI
+        tab = self.tabs[tab_id]
+        if hasattr(tab, 'frame') and tab.frame:
+            tab.frame.destroy()
+
+        # Remove tab data
+        del self.tabs[tab_id]
+
+        # If this was the active tab, switch to another
+        if self.active_tab_id == tab_id:
+            if self.tabs:
+                # Switch to the most recent tab
+                next_tab_id = max(self.tabs.keys())
+                self._switch_to_tab(next_tab_id)
+            else:
+                # No tabs left, create a new one
+                self._create_new_tab()
+
+    def _load_url_in_tab(self, tab_id: int, url: str) -> None:
+        """Load a URL in a specific tab."""
+        if tab_id not in self.tabs:
+            return
+
+        tab = self.tabs[tab_id]
+        tab.url = url
+        tab.is_loading = True
+
+        # Update tab label
+        if hasattr(tab, 'label'):
+            tab.label.config(text="Loading...")
+
+        # Navigate to the URL
+        if tab_id == self.active_tab_id:
+            self.navigate_to_url(url)
+        else:
+            # Load in background
+            threading.Thread(
+                target=self._load_url_in_tab_thread,
+                args=(tab_id, url),
+                daemon=True
+            ).start()
+
+    def _load_url_in_tab_thread(self, tab_id: int, url: str) -> None:
+        """Load a URL in a tab in a background thread."""
+        # This is a simplified version - full implementation would
+        # use the HTML5 engine to load the page
+        pass
+
+    def _update_tab_title(self, tab_id: int, title: str) -> None:
+        """Update the title of a specific tab."""
+        if tab_id not in self.tabs:
+            return
+
+        tab = self.tabs[tab_id]
+        tab.title = title
+
+        # Truncate title if too long
+        display_title = title[:30] + "..." if len(title) > 30 else title
+
+        if hasattr(tab, 'label'):
+            tab.label.config(text=display_title or "New Tab")
     
     def _create_menu(self) -> None:
         """Create the main menu bar."""
@@ -190,35 +545,124 @@ class BrowserWindow:
     
     def _create_toolbar(self) -> None:
         """Create the browser toolbar with navigation buttons and address bar."""
-        self.toolbar_frame = ttk.Frame(self.root)
-        self.toolbar_frame.pack(side=tk.TOP, fill=tk.X)
-        
-        # Navigation buttons
-        self.back_button = ttk.Button(self.toolbar_frame, text="←", width=2, command=self._go_back)
-        self.back_button.pack(side=tk.LEFT, padx=2)
-        
-        self.forward_button = ttk.Button(self.toolbar_frame, text="→", width=2, command=self._go_forward)
-        self.forward_button.pack(side=tk.LEFT, padx=2)
-        
-        self.refresh_button = ttk.Button(self.toolbar_frame, text="↻", width=2, command=self._refresh)
-        self.refresh_button.pack(side=tk.LEFT, padx=2)
-        
-        self.home_button = ttk.Button(self.toolbar_frame, text="⌂", width=2, command=self._go_home)
-        self.home_button.pack(side=tk.LEFT, padx=2)
-        
-        # Address bar
+        # Create toolbar frame with better styling
+        self.toolbar_frame = ttk.Frame(self.root, style='Toolbar.TFrame')
+        self.toolbar_frame.pack(side=tk.TOP, fill=tk.X, padx=2, pady=2)
+
+        # Configure styles for toolbar buttons
+        self.style.configure(
+            'Toolbar.TButton',
+            padding=(6, 4, 6, 4),
+            font=('Segoe UI', 11)
+        )
+
+        # Navigation button container
+        nav_frame = ttk.Frame(self.toolbar_frame)
+        nav_frame.pack(side=tk.LEFT, padx=(0, 5))
+
+        # Navigation buttons with better styling
+        self.back_button = ttk.Button(
+            nav_frame, text="◀", width=3,
+            style='Toolbar.TButton',
+            command=self._go_back
+        )
+        self.back_button.pack(side=tk.LEFT, padx=1)
+        self.back_button.state(['disabled'])
+
+        self.forward_button = ttk.Button(
+            nav_frame, text="▶", width=3,
+            style='Toolbar.TButton',
+            command=self._go_forward
+        )
+        self.forward_button.pack(side=tk.LEFT, padx=1)
+        self.forward_button.state(['disabled'])
+
+        self.refresh_button = ttk.Button(
+            nav_frame, text="⟳", width=3,
+            style='Toolbar.TButton',
+            command=self._refresh
+        )
+        self.refresh_button.pack(side=tk.LEFT, padx=1)
+
+        self.home_button = ttk.Button(
+            nav_frame, text="⌂", width=3,
+            style='Toolbar.TButton',
+            command=self._go_home
+        )
+        self.home_button.pack(side=tk.LEFT, padx=1)
+
+        # Address bar with modern styling
+        address_frame = ttk.Frame(self.toolbar_frame)
+        address_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # Security indicator (lock icon for HTTPS)
+        self.security_icon = ttk.Label(address_frame, text="", font=('Segoe UI', 10))
+        self.security_icon.pack(side=tk.LEFT, padx=(0, 2))
+
+        # Address bar entry
         self.url_var = tk.StringVar()
-        self.address_bar = ttk.Entry(self.toolbar_frame, textvariable=self.url_var)
-        self.address_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # Use a style that looks more like a browser address bar
+        self.style.configure(
+            'Address.TEntry',
+            padding=(8, 6, 8, 6),
+            fieldbackground='white'
+        )
+
+        self.address_bar = ttk.Entry(
+            address_frame,
+            textvariable=self.url_var,
+            style='Address.TEntry',
+            font=('Segoe UI', 10)
+        )
+        self.address_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.address_bar.bind("<Return>", self._on_address_enter)
-        
-        # Search bar
-        self.search_button = ttk.Button(self.toolbar_frame, text="🔍", width=2, command=self._search)
-        self.search_button.pack(side=tk.LEFT, padx=2)
-        
+        self.address_bar.bind("<FocusIn>", self._on_address_focus)
+        self.address_bar.bind("<FocusOut>", self._on_address_blur)
+
+        # Right toolbar buttons
+        right_frame = ttk.Frame(self.toolbar_frame)
+        right_frame.pack(side=tk.RIGHT, padx=2)
+
+        # Bookmark this page button
+        self.bookmark_button = ttk.Button(
+            right_frame, text="☆", width=3,
+            style='Toolbar.TButton',
+            command=self._toggle_bookmark
+        )
+        self.bookmark_button.pack(side=tk.LEFT, padx=1)
+
         # Settings button
-        self.settings_button = ttk.Button(self.toolbar_frame, text="⚙", width=2, command=self._show_settings)
-        self.settings_button.pack(side=tk.LEFT, padx=2)
+        self.settings_button = ttk.Button(
+            right_frame, text="☰", width=3,
+            style='Toolbar.TButton',
+            command=self._show_settings
+        )
+        self.settings_button.pack(side=tk.LEFT, padx=1)
+
+        # Store the original URL for display
+        self._current_url_for_display = ""
+
+    def _on_address_focus(self, event=None) -> None:
+        """Handle address bar focus - select all text."""
+        self.address_bar.select_range(0, tk.END)
+
+    def _on_address_blur(self, event=None) -> None:
+        """Handle address bar blur - restore URL display if empty."""
+        if not self.url_var.get().strip():
+            self.url_var.set(self._current_url_for_display)
+
+    def _toggle_bookmark(self) -> None:
+        """Toggle bookmark for current page."""
+        if self.current_url:
+            # Toggle bookmark state
+            current_text = self.bookmark_button.cget('text')
+            if current_text == "☆":
+                self.bookmark_button.config(text="★")
+                self.status_label.config(text="Bookmarked this page")
+            else:
+                self.bookmark_button.config(text="☆")
+                self.status_label.config(text="Removed bookmark")
     
     def _create_statusbar(self) -> None:
         """Create the status bar at the bottom of the window."""
@@ -268,21 +712,71 @@ class BrowserWindow:
         self.root.bind("<F5>", lambda e: self._refresh())
         self.root.bind("<Control-r>", lambda e: self._refresh())
         self.root.bind("<Alt-Home>", lambda e: self._go_home())
-        
+
         # Tab management
-        self.root.bind("<Control-t>", lambda e: self._new_window())
-        self.root.bind("<Control-w>", lambda e: self._close())
-        
+        self.root.bind("<Control-t>", lambda e: self._create_new_tab())
+        self.root.bind("<Control-w>", lambda e: self._close_current_tab())
+        self.root.bind("<Control-Tab>", lambda e: self._next_tab())
+        self.root.bind("<Control-Shift-Tab>", lambda e: self._previous_tab())
+
+        # Address bar focus
+        self.root.bind("<Control-l>", lambda e: self._focus_address_bar())
+        self.root.bind("<Control-d>", lambda e: self._toggle_bookmark())
+
         # Find in page
         self.root.bind("<Control-f>", lambda e: self._find_in_page())
-        
+        self.root.bind("<F3>", lambda e: self._find_next())
+        self.root.bind("<Shift-F3>", lambda e: self._find_previous())
+        self.root.bind("<Escape>", lambda e: self._close_find_bar())
+
         # Zoom controls
         self.root.bind("<Control-plus>", lambda e: self._zoom_in())
         self.root.bind("<Control-minus>", lambda e: self._zoom_out())
         self.root.bind("<Control-0>", lambda e: self._zoom_reset())
-        
+        self.root.bind("<Control-equal>", lambda e: self._zoom_in())  # For keyboards without numpad
+
         # Developer tools
         self.root.bind("<F12>", lambda e: self._view_source())
+        self.root.bind("<Control-u>", lambda e: self._view_source())
+
+        # History
+        self.root.bind("<Control-h>", lambda e: self._show_history())
+
+        # New window
+        self.root.bind("<Control-n>", lambda e: self._new_window())
+        self.root.bind("<Control-Shift-n>", lambda e: self._new_private_window())
+
+    def _focus_address_bar(self) -> None:
+        """Focus the address bar and select its contents."""
+        self.address_bar.focus_set()
+        self.address_bar.select_range(0, tk.END)
+
+    def _close_current_tab(self) -> None:
+        """Close the currently active tab."""
+        if self.active_tab_id is not None:
+            self._close_tab(self.active_tab_id)
+
+    def _next_tab(self) -> None:
+        """Switch to the next tab."""
+        if not self.tabs:
+            return
+        tab_ids = sorted(self.tabs.keys())
+        current_idx = tab_ids.index(self.active_tab_id) if self.active_tab_id in tab_ids else 0
+        next_idx = (current_idx + 1) % len(tab_ids)
+        self._switch_to_tab(tab_ids[next_idx])
+
+    def _previous_tab(self) -> None:
+        """Switch to the previous tab."""
+        if not self.tabs:
+            return
+        tab_ids = sorted(self.tabs.keys())
+        current_idx = tab_ids.index(self.active_tab_id) if self.active_tab_id in tab_ids else 0
+        prev_idx = (current_idx - 1) % len(tab_ids)
+        self._switch_to_tab(tab_ids[prev_idx])
+
+    def _show_history(self) -> None:
+        """Show the history sidebar or dialog."""
+        messagebox.showinfo("History", "History sidebar not implemented yet.")
     
     def _on_address_enter(self, event=None) -> None:
         """Handle address bar enter key press."""
@@ -539,38 +1033,48 @@ class BrowserWindow:
     
     def _go_back(self) -> None:
         """Navigate back in history."""
-        if self.current_history_index > 0:
-            self.current_history_index -= 1
-            url = self.history[self.current_history_index]
+        if self.active_tab_id is None or self.active_tab_id not in self.tabs:
+            return
+
+        tab = self.tabs[self.active_tab_id]
+        url = tab.go_back()
+        if url:
             self.url_var.set(url)
             self.navigate_to_url(url)
-            self._update_navigation_state()
-    
+            self._update_navigation_state_for_tab(tab)
+
     def _go_forward(self) -> None:
         """Navigate forward in history."""
-        if self.current_history_index < len(self.history) - 1:
-            self.current_history_index += 1
-            url = self.history[self.current_history_index]
+        if self.active_tab_id is None or self.active_tab_id not in self.tabs:
+            return
+
+        tab = self.tabs[self.active_tab_id]
+        url = tab.go_forward()
+        if url:
             self.url_var.set(url)
             self.navigate_to_url(url)
-            self._update_navigation_state()
-    
+            self._update_navigation_state_for_tab(tab)
+
     def _refresh(self) -> None:
         """Refresh the current page."""
-        if self.is_loading:
+        if self.active_tab_id is None or self.active_tab_id not in self.tabs:
+            return
+
+        tab = self.tabs[self.active_tab_id]
+
+        if tab.is_loading:
             # Stop loading
-            self.is_loading = False
+            tab.is_loading = False
             self.status_label.config(text="Stopped")
-            self.refresh_button.config(text="↻")
+            self.refresh_button.config(text="⟳")
         else:
             # Refresh the page
-            if self.current_url:
+            if tab.url:
                 # Remove from cache to force reload
-                if self.current_url in self.content_cache:
-                    del self.content_cache[self.current_url]
-                
-                self.navigate_to_url(self.current_url)
-    
+                if tab.url in self.content_cache:
+                    del self.content_cache[tab.url]
+
+                self.navigate_to_url(tab.url)
     def _go_home(self) -> None:
         """Navigate to homepage."""
         self.load_homepage()
@@ -665,8 +1169,118 @@ class BrowserWindow:
         messagebox.showinfo("Print", "Printing not implemented yet.")
     
     def _find_in_page(self) -> None:
-        """Open find in page dialog."""
-        messagebox.showinfo("Find", "Find in page not implemented yet.")
+        """Open find in page bar."""
+        # Create find bar if it doesn't exist
+        if not hasattr(self, 'find_frame') or self.find_frame is None:
+            self._create_find_bar()
+
+        # Show the find bar
+        if self.find_frame:
+            self.find_frame.pack(side=tk.TOP, fill=tk.X, after=self.toolbar_frame)
+            self.find_entry.focus_set()
+            self.find_entry.delete(0, tk.END)
+
+    def _create_find_bar(self) -> None:
+        """Create the find in page bar."""
+        self.find_frame = ttk.Frame(self.root, style='TFrame')
+
+        # Find label
+        find_label = ttk.Label(self.find_frame, text="Find:")
+        find_label.pack(side=tk.LEFT, padx=5)
+
+        # Find entry
+        self.find_var = tk.StringVar()
+        self.find_entry = ttk.Entry(
+            self.find_frame,
+            textvariable=self.find_var,
+            width=30,
+            font=('Segoe UI', 10)
+        )
+        self.find_entry.pack(side=tk.LEFT, padx=5)
+        self.find_entry.bind('<Return>', self._find_next)
+        self.find_entry.bind('<Shift-Return>', self._find_previous)
+
+        # Previous/Next buttons
+        prev_button = ttk.Button(
+            self.find_frame,
+            text="▲",
+            width=3,
+            command=self._find_previous
+        )
+        prev_button.pack(side=tk.LEFT, padx=2)
+
+        next_button = ttk.Button(
+            self.find_frame,
+            text="▼",
+            width=3,
+            command=self._find_next
+        )
+        next_button.pack(side=tk.LEFT, padx=2)
+
+        # Match count label
+        self.match_label = ttk.Label(self.find_frame, text="")
+        self.match_label.pack(side=tk.LEFT, padx=5)
+
+        # Close button
+        close_button = ttk.Button(
+            self.find_frame,
+            text="×",
+            width=3,
+            command=self._close_find_bar
+        )
+        close_button.pack(side=tk.RIGHT, padx=5)
+
+        # Bind escape to close
+        self.find_entry.bind('<Escape>', lambda e: self._close_find_bar())
+
+        # Track current match
+        self._current_match_index = 0
+        self._matches = []
+
+    def _find_next(self, event=None) -> None:
+        """Find the next match."""
+        search_text = self.find_var.get()
+        if not search_text:
+            return
+
+        # Search in the current document
+        if self.html5_engine.document:
+            matches = self._search_in_document(search_text)
+            if matches:
+                self._current_match_index = (self._current_match_index + 1) % len(matches)
+                self._highlight_match(matches[self._current_match_index])
+                self.match_label.config(text=f"{self._current_match_index + 1}/{len(matches)}")
+            else:
+                self.match_label.config(text="No matches")
+
+    def _find_previous(self, event=None) -> None:
+        """Find the previous match."""
+        search_text = self.find_var.get()
+        if not search_text:
+            return
+
+        # Search in the current document
+        if self.html5_engine.document:
+            matches = self._search_in_document(search_text)
+            if matches:
+                self._current_match_index = (self._current_match_index - 1) % len(matches)
+                self._highlight_match(matches[self._current_match_index])
+                self.match_label.config(text=f"{self._current_match_index + 1}/{len(matches)}")
+
+    def _search_in_document(self, text: str) -> List:
+        """Search for text in the document."""
+        # Simplified - would need full implementation to search DOM
+        return []
+
+    def _highlight_match(self, match) -> None:
+        """Highlight a specific match."""
+        # Would implement scrolling and highlighting
+        pass
+
+    def _close_find_bar(self) -> None:
+        """Close the find bar."""
+        if hasattr(self, 'find_frame') and self.find_frame:
+            self.find_frame.pack_forget()
     
     def _zoom_in(self) -> None:
         """Zoom in the page view."""

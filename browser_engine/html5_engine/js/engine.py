@@ -52,7 +52,17 @@ class JSEngine:
         
         # Create a separate thread for background evaluation
         self.eval_thread = None
-        
+
+        # Timer management
+        self._timers = {}  # timer_id -> (callback_code, type, thread)
+        self._timer_counter = 1
+        self._timer_lock = threading.Lock()
+
+        # XHR management
+        self._xhr_instances = {}  # xhr_id -> {method, url, headers, data, async}
+        self._xhr_counter = 1
+        self._xhr_lock = threading.Lock()
+
         logger.info("JavaScript engine initialized")
     
     def _setup_global_objects(self) -> None:
@@ -124,11 +134,15 @@ class JSEngine:
         timers_js = """
         var _timers = {};
         var _timerIdCounter = 1;
-        
+        var _storedCallbacks = {};  // Store callbacks by ID for execution
+
         function setTimeout(callback, delay) {
             var timerId = _timerIdCounter++;
+            // Store the callback as a string representation for later execution
+            var callbackId = 'cb_' + timerId;
+            _storedCallbacks[callbackId] = callback;
             _timers[timerId] = {
-                callback: callback,
+                callbackId: callbackId,
                 type: 'timeout',
                 delay: delay,
                 createdAt: Date.now()
@@ -136,18 +150,24 @@ class JSEngine:
             _scheduleTimer(timerId, delay);
             return timerId;
         }
-        
+
         function clearTimeout(timerId) {
             if (_timers[timerId]) {
+                var callbackId = _timers[timerId].callbackId;
+                if (callbackId && _storedCallbacks[callbackId]) {
+                    delete _storedCallbacks[callbackId];
+                }
                 delete _timers[timerId];
                 _clearTimer(timerId);
             }
         }
-        
+
         function setInterval(callback, delay) {
             var timerId = _timerIdCounter++;
+            var callbackId = 'cb_' + timerId;
+            _storedCallbacks[callbackId] = callback;
             _timers[timerId] = {
-                callback: callback,
+                callbackId: callbackId,
                 type: 'interval',
                 delay: delay,
                 createdAt: Date.now()
@@ -155,44 +175,44 @@ class JSEngine:
             _scheduleTimer(timerId, delay);
             return timerId;
         }
-        
+
         function clearInterval(timerId) {
             if (_timers[timerId]) {
+                var callbackId = _timers[timerId].callbackId;
+                if (callbackId && _storedCallbacks[callbackId]) {
+                    delete _storedCallbacks[callbackId];
+                }
                 delete _timers[timerId];
                 _clearTimer(timerId);
+            }
+        }
+
+        // Function to execute a stored callback by ID
+        function _executeTimerCallback(callbackId) {
+            if (_storedCallbacks[callbackId]) {
+                try {
+                    if (typeof _storedCallbacks[callbackId] === 'function') {
+                        _storedCallbacks[callbackId]();
+                    }
+                } catch(e) {
+                    console.error('Timer callback error:', e);
+                }
             }
         }
         """
         
         # Define JSON methods
         json_js = """
+        // Duktape has built-in JSON support, but ensure it's properly available
         if (!window.JSON) {
             window.JSON = {
                 parse: function(text) {
-                    return eval('(' + text + ')');
+                    // Use Duktape's built-in JSON parser (safer than eval)
+                    return JSON.parse(text);
                 },
-                stringify: function(obj) {
-                    // Simple implementation
-                    if (obj === null) return 'null';
-                    if (obj === undefined) return undefined;
-                    if (typeof obj === 'string') return '"' + obj.replace(/"/g, '\\"') + '"';
-                    if (typeof obj === 'number') return obj.toString();
-                    if (typeof obj === 'boolean') return obj.toString();
-                    if (Array.isArray(obj)) {
-                        return '[' + obj.map(function(item) { 
-                            return JSON.stringify(item);
-                        }).join(',') + ']';
-                    }
-                    if (typeof obj === 'object') {
-                        var pairs = [];
-                        for (var key in obj) {
-                            if (obj.hasOwnProperty(key)) {
-                                pairs.push('"' + key + '":' + JSON.stringify(obj[key]));
-                            }
-                        }
-                        return '{' + pairs.join(',') + '}';
-                    }
-                    return '{}';
+                stringify: function(obj, replacer, space) {
+                    // Use Duktape's built-in JSON stringify
+                    return JSON.stringify(obj, replacer, space);
                 }
             };
         }
@@ -356,6 +376,9 @@ class JSEngine:
         
         # Define XMLHttpRequest
         xhr_js = """
+        // XHR object registry to allow Python to access XHR instances
+        var _xhrObjects = {};
+
         function XMLHttpRequest() {
             this.readyState = 0;
             this.status = 0;
@@ -368,7 +391,7 @@ class JSEngine:
             this.onload = null;
             this.onerror = null;
             this.upload = {};
-            
+
             this.open = function(method, url, async) {
                 this.method = method;
                 this.url = url;
@@ -377,33 +400,355 @@ class JSEngine:
                 if (this.onreadystatechange) this.onreadystatechange();
                 _xhr_open(this._id, method, url, this.async);
             };
-            
+
             this.setRequestHeader = function(header, value) {
                 _xhr_setRequestHeader(this._id, header, value);
             };
-            
+
             this.send = function(data) {
                 this.readyState = 2;
                 if (this.onreadystatechange) this.onreadystatechange();
                 _xhr_send(this._id, data || '');
             };
-            
+
             this.abort = function() {
                 _xhr_abort(this._id);
             };
-            
+
+            this.getAllResponseHeaders = function() {
+                return '';
+            };
+
+            this.getResponseHeader = function(name) {
+                return null;
+            };
+
             this._id = _xhr_create();
+            // Register this XHR object in the registry
+            _xhrObjects['xhr_' + this._id] = this;
         }
         window.XMLHttpRequest = XMLHttpRequest;
         """
-        
+
+        # Fetch API implementation
+        fetch_js = """
+        // Fetch API implementation using XMLHttpRequest
+        function fetch(url, options) {
+            options = options || {};
+            var method = options.method || 'GET';
+            var headers = options.headers || {};
+            var body = options.body || null;
+            var signal = options.signal || null;
+
+            return new Promise(function(resolve, reject) {
+                var xhr = new XMLHttpRequest();
+                xhr.open(method, url, true);
+
+                // Set headers
+                if (headers) {
+                    for (var key in headers) {
+                        if (Object.prototype.hasOwnProperty.call(headers, key)) {
+                            xhr.setRequestHeader(key, headers[key]);
+                        }
+                    }
+                }
+
+                xhr.onload = function() {
+                    var response = {
+                        ok: xhr.status >= 200 && xhr.status < 300,
+                        status: xhr.status,
+                        statusText: xhr.statusText,
+                        url: url,
+                        type: 'basic',
+                        redirected: false,
+                        text: function() {
+                            return Promise.resolve(xhr.responseText);
+                        },
+                        json: function() {
+                            try {
+                                return Promise.resolve(JSON.parse(xhr.responseText));
+                            } catch(e) {
+                                return Promise.reject(new SyntaxError('Invalid JSON: ' + e.message));
+                            }
+                        },
+                        blob: function() {
+                            return Promise.resolve(new Blob([xhr.responseText]));
+                        },
+                        arrayBuffer: function() {
+                            return Promise.resolve(new ArrayBuffer(0));
+                        },
+                        clone: function() {
+                            return new Response(xhr.responseText, {
+                                status: xhr.status,
+                                statusText: xhr.statusText
+                            });
+                        },
+                        headers: new Headers()
+                    };
+                    resolve(response);
+                };
+
+                xhr.onerror = function() {
+                    reject(new TypeError('Network request failed'));
+                };
+
+                xhr.ontimeout = function() {
+                    reject(new TypeError('Network request timed out'));
+                };
+
+                // Handle abort signal
+                if (signal && signal.aborted) {
+                    xhr.abort();
+                    reject(new DOMException('The user aborted a request.', 'AbortError'));
+                    return;
+                }
+
+                xhr.send(body);
+            });
+        }
+        window.fetch = fetch;
+
+        // Headers interface
+        function Headers(init) {
+            this._headers = {};
+            if (init) {
+                if (Array.isArray(init)) {
+                    for (var i = 0; i < init.length; i++) {
+                        this.append(init[i][0], init[i][1]);
+                    }
+                } else if (typeof init === 'object') {
+                    for (var key in init) {
+                        if (Object.prototype.hasOwnProperty.call(init, key)) {
+                            this.append(key, init[key]);
+                        }
+                    }
+                }
+            }
+        }
+        Headers.prototype.append = function(name, value) {
+            name = String(name).toLowerCase();
+            if (!this._headers[name]) this._headers[name] = [];
+            this._headers[name].push(String(value));
+        };
+        Headers.prototype.delete = function(name) {
+            delete this._headers[String(name).toLowerCase()];
+        };
+        Headers.prototype.get = function(name) {
+            var values = this._headers[String(name).toLowerCase()];
+            return values ? values[0] : null;
+        };
+        Headers.prototype.getAll = function(name) {
+            return this._headers[String(name).toLowerCase()] || [];
+        };
+        Headers.prototype.has = function(name) {
+            return String(name).toLowerCase() in this._headers;
+        };
+        Headers.prototype.set = function(name, value) {
+            name = String(name).toLowerCase();
+            this._headers[name] = [String(value)];
+        };
+        Headers.prototype.keys = function() {
+            return Object.keys(this._headers);
+        };
+        Headers.prototype.values = function() {
+            var self = this;
+            return Object.keys(this._headers).map(function(k) { return self._headers[k][0]; });
+        };
+        Headers.prototype.entries = function() {
+            var self = this;
+            return Object.keys(this._headers).map(function(k) { return [k, self._headers[k][0]]; });
+        };
+        window.Headers = Headers;
+
+        // Response interface
+        function Response(body, init) {
+            init = init || {};
+            this.body = body;
+            this.bodyUsed = false;
+            this.status = init.status !== undefined ? init.status : 200;
+            this.statusText = init.statusText || '';
+            this.ok = this.status >= 200 && this.status < 300;
+            this.redirected = init.redirected || false;
+            this.type = init.type || 'basic';
+            this.url = init.url || '';
+            this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
+        }
+        Response.prototype.text = function() {
+            this.bodyUsed = true;
+            return Promise.resolve(this.body);
+        };
+        Response.prototype.json = function() {
+            this.bodyUsed = true;
+            return Promise.resolve(JSON.parse(this.body));
+        };
+        Response.prototype.blob = function() {
+            this.bodyUsed = true;
+            return Promise.resolve(new Blob([this.body]));
+        };
+        Response.prototype.clone = function() {
+            return new Response(this.body, {
+                status: this.status,
+                statusText: this.statusText,
+                headers: this.headers,
+                url: this.url
+            });
+        };
+        Response.error = function() {
+            return new Response(null, { status: 0, statusText: '', type: 'error' });
+        };
+        Response.redirect = function(url, status) {
+            status = status || 302;
+            return new Response(null, { status: status, headers: { Location: url } });
+        };
+        window.Response = Response;
+
+        // Request interface
+        function Request(input, init) {
+            init = init || {};
+            if (typeof input === 'string') {
+                this.url = input;
+            } else if (input instanceof Request) {
+                this.url = input.url;
+                this.method = input.method;
+                this.headers = input.headers;
+                this.body = input.body;
+            } else {
+                this.url = String(input);
+            }
+            this.method = init.method || 'GET';
+            this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
+            this.body = init.body || null;
+            this.credentials = init.credentials || 'same-origin';
+            this.cache = init.cache || 'default';
+            this.redirect = init.redirect || 'follow';
+            this.referrer = init.referrer || '';
+            this.mode = init.mode || 'cors';
+        }
+        Request.prototype.text = function() {
+            return Promise.resolve(this.body || '');
+        };
+        Request.prototype.json = function() {
+            return Promise.resolve(JSON.parse(this.body || '{}'));
+        };
+        Request.prototype.clone = function() {
+            return new Request(this.url, {
+                method: this.method,
+                headers: this.headers,
+                body: this.body
+            });
+        };
+        window.Request = Request;
+
+        // Blob interface (simplified)
+        function Blob(parts, options) {
+            this.parts = parts || [];
+            this.size = 0;
+            for (var i = 0; i < this.parts.length; i++) {
+                var part = this.parts[i];
+                this.size += typeof part === 'string' ? part.length : (part.size || 0);
+            }
+            this.type = options && options.type ? options.type : '';
+        }
+        Blob.prototype.slice = function(start, end, type) {
+            return new Blob(this.parts.slice(start, end), { type: type || this.type });
+        };
+        Blob.prototype.text = function() {
+            return Promise.resolve(this.parts.join(''));
+        };
+        Blob.prototype.arrayBuffer = function() {
+            return Promise.resolve(new ArrayBuffer(this.size));
+        };
+        window.Blob = Blob;
+
+        // ArrayBuffer (stub)
+        function ArrayBuffer(length) {
+            this.length = length;
+            this.byteLength = length;
+        }
+        window.ArrayBuffer = ArrayBuffer;
+
+        // AbortController and AbortSignal
+        function AbortController() {
+            this.signal = new AbortSignal();
+        }
+        AbortController.prototype.abort = function() {
+            this.signal._aborted = true;
+        };
+        window.AbortController = AbortController;
+
+        function AbortSignal() {
+            this._aborted = false;
+        }
+        Object.defineProperty(AbortSignal.prototype, 'aborted', {
+            get: function() { return this._aborted; }
+        });
+        window.AbortSignal = AbortSignal;
+
+        // URL and URLSearchParams (basic implementation)
+        function URL(url, base) {
+            if (base) {
+                url = base + (url.startsWith('/') ? '' : '/') + url;
+            }
+            this.href = url;
+            this.protocol = '';
+            this.host = '';
+            this.hostname = '';
+            this.port = '';
+            this.pathname = '';
+            this.search = '';
+            this.hash = '';
+
+            // Simple parsing
+            var match = url.match(/^(https?:)\\/\\/([^\\/\\?#]+)(\\/[^?#]*)?(\\?[^#]*)?(#.*)?$/);
+            if (match) {
+                this.protocol = match[1];
+                this.host = match[2];
+                this.hostname = match[2].split(':')[0];
+                this.port = match[2].split(':')[1] || '';
+                this.pathname = match[3] || '/';
+                this.search = match[4] || '';
+                this.hash = match[5] || '';
+            }
+        }
+        URL.prototype.toString = function() { return this.href; };
+        window.URL = URL;
+
+        function URLSearchParams(init) {
+            this.params = {};
+            if (typeof init === 'string') {
+                var pairs = init.replace(/^\\?/, '').split('&');
+                for (var i = 0; i < pairs.length; i++) {
+                    var pair = pairs[i].split('=');
+                    if (pair[0]) {
+                        this.params[decodeURIComponent(pair[0])] = decodeURIComponent(pair[1] || '');
+                    }
+                }
+            }
+        }
+        URLSearchParams.prototype.append = function(name, value) {
+            this.params[name] = value;
+        };
+        URLSearchParams.prototype.get = function(name) {
+            return this.params[name] || null;
+        };
+        URLSearchParams.prototype.toString = function() {
+            var pairs = [];
+            for (var key in this.params) {
+                pairs.push(encodeURIComponent(key) + '=' + encodeURIComponent(this.params[key]));
+            }
+            return pairs.join('&');
+        };
+        window.URLSearchParams = URLSearchParams;
+        """
+
         # Execute all the setup code
         self.interpreter.evaljs(window_js)
         self.interpreter.evaljs(navigator_js)
         self.interpreter.evaljs(timers_js)
         self.interpreter.evaljs(json_js)
         self.interpreter.evaljs(xhr_js)
-        
+        self.interpreter.evaljs(fetch_js)  # Add fetch API
+
         # Register Python callbacks for JS functions
         self.interpreter.export_function('_scheduleTimer', self._schedule_timer)
         self.interpreter.export_function('_clearTimer', self._clear_timer)
@@ -689,32 +1034,45 @@ class JSEngine:
             Promise.prototype.catch = function(onRejected) {
                 return this.then(null, onRejected);
             };
-            
+
+            Promise.prototype.finally = function(onFinally) {
+                return this.then(
+                    function(value) {
+                        if (typeof onFinally === 'function') onFinally();
+                        return value;
+                    },
+                    function(reason) {
+                        if (typeof onFinally === 'function') onFinally();
+                        throw reason;
+                    }
+                );
+            };
+
             Promise.resolve = function(value) {
                 return new Promise(function(resolve) {
                     resolve(value);
                 });
             };
-            
+
             Promise.reject = function(reason) {
                 return new Promise(function(resolve, reject) {
                     reject(reason);
                 });
             };
-            
+
             Promise.all = function(promises) {
                 return new Promise(function(resolve, reject) {
                     if (!Array.isArray(promises)) {
                         return reject(new TypeError('Promise.all accepts an array'));
                     }
-                    
+
                     var results = [];
                     var remaining = promises.length;
-                    
+
                     if (remaining === 0) {
                         return resolve(results);
                     }
-                    
+
                     function resolvePromise(i, value) {
                         results[i] = value;
                         remaining--;
@@ -722,7 +1080,7 @@ class JSEngine:
                             resolve(results);
                         }
                     }
-                    
+
                     for (var i = 0; i < promises.length; i++) {
                         (function(i) {
                             var promise = promises[i];
@@ -737,6 +1095,93 @@ class JSEngine:
                                 );
                             } else {
                                 resolvePromise(i, promise);
+                            }
+                        })(i);
+                    }
+                });
+            };
+
+            Promise.race = function(promises) {
+                return new Promise(function(resolve, reject) {
+                    if (!Array.isArray(promises)) {
+                        return reject(new TypeError('Promise.race accepts an array'));
+                    }
+
+                    for (var i = 0; i < promises.length; i++) {
+                        var promise = promises[i];
+                        if (promise && typeof promise.then === 'function') {
+                            promise.then(resolve, reject);
+                        } else {
+                            resolve(promise);
+                            return;
+                        }
+                    }
+                });
+            };
+
+            Promise.allSettled = function(promises) {
+                return new Promise(function(resolve) {
+                    if (!Array.isArray(promises)) {
+                        return resolve([]);
+                    }
+
+                    var results = [];
+                    var remaining = promises.length;
+
+                    if (remaining === 0) {
+                        return resolve(results);
+                    }
+
+                    function settlePromise(i, status, value) {
+                        results[i] = { status: status, value: value };
+                        remaining--;
+                        if (remaining === 0) {
+                            resolve(results);
+                        }
+                    }
+
+                    for (var i = 0; i < promises.length; i++) {
+                        (function(i) {
+                            var promise = promises[i];
+                            if (promise && typeof promise.then === 'function') {
+                                promise.then(
+                                    function(value) { settlePromise(i, 'fulfilled', value); },
+                                    function(reason) { settlePromise(i, 'rejected', reason); }
+                                );
+                            } else {
+                                settlePromise(i, 'fulfilled', promise);
+                            }
+                        })(i);
+                    }
+                });
+            };
+
+            Promise.any = function(promises) {
+                return new Promise(function(resolve, reject) {
+                    if (!Array.isArray(promises)) {
+                        return reject(new TypeError('Promise.any accepts an array'));
+                    }
+
+                    var errors = [];
+                    var remaining = promises.length;
+
+                    if (remaining === 0) {
+                        return reject(new AggregateError([], 'All promises were rejected'));
+                    }
+
+                    for (var i = 0; i < promises.length; i++) {
+                        (function(i) {
+                            var promise = promises[i];
+                            if (promise && typeof promise.then === 'function') {
+                                promise.then(resolve, function(reason) {
+                                    errors[i] = reason;
+                                    remaining--;
+                                    if (remaining === 0) {
+                                        reject(new AggregateError(errors, 'All promises were rejected'));
+                                    }
+                                });
+                            } else {
+                                resolve(promise);
                             }
                         })(i);
                     }
@@ -896,101 +1341,217 @@ class JSEngine:
     def _schedule_timer(self, timer_id: int, delay: int) -> None:
         """
         Schedule a timer for execution.
-        
+
         Args:
             timer_id: The timer ID
             delay: Delay in milliseconds
         """
-        # In a real implementation, would schedule the timer
-        # For now, just log it
+        delay_seconds = max(0, delay / 1000.0)  # Convert to seconds, ensure non-negative
+
+        def execute_timer():
+            with self._timer_lock:
+                if timer_id not in self._timers:
+                    return
+                timer_info = self._timers[timer_id]
+                callback_id = timer_info.get('callbackId', f'cb_{timer_id}')
+                timer_type = timer_info.get('type', 'timeout')
+
+            try:
+                # Execute the callback using the stored callback ID in JS
+                self.interpreter.evaljs(f"_executeTimerCallback('{callback_id}')")
+                logger.debug(f"Timer {timer_id} callback executed")
+
+                # If it's an interval, reschedule it
+                if timer_type == 'interval':
+                    with self._timer_lock:
+                        if timer_id in self._timers:
+                            timer_info['thread'] = threading.Timer(delay_seconds, execute_timer)
+                            timer_info['thread'].daemon = True
+                            timer_info['thread'].start()
+            except Exception as e:
+                logger.error(f"Error executing timer {timer_id}: {e}")
+
+        # Start the timer
+        timer_thread = threading.Timer(delay_seconds, execute_timer)
+        timer_thread.daemon = True
+        timer_thread.start()
+
+        with self._timer_lock:
+            self._timers[timer_id] = {
+                'thread': timer_thread,
+                'type': 'timeout',  # Will be updated if interval
+                'callbackId': f'cb_{timer_id}'
+            }
+
         logger.debug(f"Scheduled timer {timer_id} with delay {delay}ms")
     
     def _clear_timer(self, timer_id: int) -> None:
         """
         Clear a scheduled timer.
-        
+
         Args:
             timer_id: The timer ID to clear
         """
+        with self._timer_lock:
+            if timer_id in self._timers:
+                timer_info = self._timers[timer_id]
+                if 'thread' in timer_info and timer_info['thread']:
+                    timer_info['thread'].cancel()
+                del self._timers[timer_id]
         logger.debug(f"Cleared timer {timer_id}")
-    
+
     def _xhr_create(self) -> int:
         """
         Create a new XMLHttpRequest instance.
-        
+
         Returns:
             ID for the new XHR instance
         """
-        # In a real implementation, would create an XHR instance
-        return 1  # Dummy ID
-    
+        with self._xhr_lock:
+            xhr_id = self._xhr_counter
+            self._xhr_counter += 1
+            self._xhr_instances[xhr_id] = {
+                'method': None,
+                'url': None,
+                'headers': {},
+                'data': None,
+                'async': True
+            }
+        logger.debug(f"Created XHR instance with ID {xhr_id}")
+        return xhr_id
+
     def _xhr_open(self, xhr_id: int, method: str, url: str, async_flag: bool) -> None:
         """
         Handle XMLHttpRequest.open.
-        
+
         Args:
             xhr_id: The XHR instance ID
             method: HTTP method
             url: Request URL
             async_flag: Whether the request is asynchronous
         """
+        with self._xhr_lock:
+            if xhr_id in self._xhr_instances:
+                self._xhr_instances[xhr_id]['method'] = method
+                self._xhr_instances[xhr_id]['url'] = url
+                self._xhr_instances[xhr_id]['async'] = async_flag
         logger.debug(f"XHR {xhr_id} open: {method} {url} (async: {async_flag})")
-    
+
     def _xhr_set_request_header(self, xhr_id: int, header: str, value: str) -> None:
         """
         Handle XMLHttpRequest.setRequestHeader.
-        
+
         Args:
             xhr_id: The XHR instance ID
             header: Header name
             value: Header value
         """
+        with self._xhr_lock:
+            if xhr_id in self._xhr_instances:
+                self._xhr_instances[xhr_id]['headers'][header] = value
         logger.debug(f"XHR {xhr_id} setRequestHeader: {header}={value}")
-    
+
     def _xhr_send(self, xhr_id: int, data: str) -> None:
         """
         Handle XMLHttpRequest.send.
-        
+
         Args:
             xhr_id: The XHR instance ID
             data: Request data
         """
+        with self._xhr_lock:
+            if xhr_id not in self._xhr_instances:
+                logger.warning(f"XHR {xhr_id} not found")
+                return
+            xhr_info = self._xhr_instances[xhr_id].copy()
+            xhr_info['data'] = data
+
         logger.debug(f"XHR {xhr_id} send: {data}")
-        
-        # In a real implementation, would perform the actual HTTP request
-        # For now, simulate a successful response after a short delay
-        threading.Timer(0.5, self._simulate_xhr_response, args=[xhr_id]).start()
-    
-    def _simulate_xhr_response(self, xhr_id: int) -> None:
+
+        # Make the actual HTTP request in a separate thread
+        def perform_request():
+            try:
+                import urllib.request
+                url = xhr_info.get('url', '')
+                method = xhr_info.get('method', 'GET').upper()
+                headers = xhr_info.get('headers', {})
+                request_data = xhr_info.get('data')
+
+                # Create request
+                req = urllib.request.Request(url, method=method)
+
+                # Add headers
+                for header, value in headers.items():
+                    req.add_header(header, value)
+
+                # Add data for POST/PUT requests
+                if request_data and method in ('POST', 'PUT', 'PATCH'):
+                    req.data = request_data.encode('utf-8')
+
+                # Perform request
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as response:
+                        response_text = response.read().decode('utf-8', errors='replace')
+                        status = response.status
+                        self._complete_xhr(xhr_id, status, response_text)
+                except urllib.error.HTTPError as e:
+                    response_text = e.read().decode('utf-8', errors='replace')
+                    self._complete_xhr(xhr_id, e.code, response_text)
+                except urllib.error.URLError as e:
+                    self._complete_xhr(xhr_id, 0, str(e.reason))
+                except Exception as e:
+                    self._complete_xhr(xhr_id, 0, str(e))
+
+            except Exception as e:
+                logger.error(f"XHR {xhr_id} request error: {e}")
+                self._complete_xhr(xhr_id, 0, str(e))
+
+        # Start request in background thread
+        thread = threading.Thread(target=perform_request, daemon=True)
+        thread.start()
+
+    def _complete_xhr(self, xhr_id: int, status: int, response_text: str) -> None:
         """
-        Simulate an XHR response.
-        
+        Complete an XHR request with the response.
+
         Args:
             xhr_id: The XHR instance ID
+            status: HTTP status code
+            response_text: Response text
         """
-        # Set readyState to 4 (DONE)
-        self.interpreter.evaljs(f"""
-        (function() {{
-            var xhr = document.querySelector('[xhr-id="{xhr_id}"]')._xhr;
-            if (xhr) {{
-                xhr.readyState = 4;
-                xhr.status = 200;
-                xhr.statusText = 'OK';
-                xhr.responseText = '{{"message": "This is a simulated response"}}';
-                xhr.response = xhr.responseText;
-                if (xhr.onreadystatechange) xhr.onreadystatechange();
-                if (xhr.onload) xhr.onload();
-            }}
-        }})();
-        """)
-    
+        try:
+            # Escape the response text for JS
+            escaped_response = response_text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+
+            # Update the XHR object in JS and trigger callbacks
+            self.interpreter.evaljs(f"""
+            (function() {{
+                if (typeof _xhrObjects !== 'undefined' && _xhrObjects['xhr_{xhr_id}']) {{
+                    var xhr = _xhrObjects['xhr_{xhr_id}'];
+                    xhr.readyState = 4;
+                    xhr.status = {status};
+                    xhr.statusText = '{status} OK';
+                    xhr.responseText = "{escaped_response}";
+                    xhr.response = xhr.responseText;
+                    if (xhr.onreadystatechange) xhr.onreadystatechange();
+                    if (xhr.onload) xhr.onload();
+                }}
+            }})();
+            """)
+            logger.debug(f"XHR {xhr_id} completed with status {status}")
+        except Exception as e:
+            logger.error(f"Error completing XHR {xhr_id}: {e}")
+
     def _xhr_abort(self, xhr_id: int) -> None:
         """
         Handle XMLHttpRequest.abort.
-        
+
         Args:
             xhr_id: The XHR instance ID
         """
+        with self._xhr_lock:
+            if xhr_id in self._xhr_instances:
+                del self._xhr_instances[xhr_id]
         logger.debug(f"XHR {xhr_id} abort")
     
     def _evaluate_in_thread(self, code: str) -> None:

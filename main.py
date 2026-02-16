@@ -22,6 +22,7 @@ from browser_engine.privacy.ad_blocker import AdBlocker
 from browser_engine.extensions.extension_manager import ExtensionManager
 from browser_engine.utils.profile_manager import ProfileManager
 from browser_engine.ui.browser_window import BrowserWindow
+from browser_engine.html5_engine import HTML5Engine
 
 # Configure logging
 def setup_logging(debug=False):
@@ -99,7 +100,14 @@ def main():
     style.configure('TButton', font=('Segoe UI', 10))
     style.configure('TEntry', font=('Segoe UI', 10))
     style.configure('TLabel', font=('Segoe UI', 10))
-    
+
+    # Initialize HTML5 engine
+    html5_engine = HTML5Engine(
+        width=1024,
+        height=768,
+        debug=args.debug
+    )
+
     # Create and run browser window
     browser = BrowserWindow(
         root,
@@ -108,6 +116,7 @@ def main():
         profile_manager=profile_manager,
         extension_manager=extension_manager,
         config_manager=config_manager,
+        html5_engine=html5_engine,
         disable_javascript=args.disable_js,
         private_mode=args.private,
         debug_mode=args.debug

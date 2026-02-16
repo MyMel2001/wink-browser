@@ -108,6 +108,7 @@ def main():
             extension_manager,
             profile_manager,
             config_manager,
+            html5_engine=html5_engine,
             disable_javascript=args.text_only,
             private_mode=args.private,
             debug_mode=args.debug
