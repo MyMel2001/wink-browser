@@ -3,14 +3,18 @@ import math
 from typing import Dict, List, Optional, Tuple, Union
 
 from .box_metrics import BoxMetrics
+from ..css.custom_properties import get_custom_properties
+from ..css.custom_properties import CSSCustomProperties, resolve_css_value
+from ..css.value_functions import get_value_functions, resolve_css_value as resolve_math_functions
+
 
 class LayoutBox:
     """
     Represents a box in the layout tree.
-    
+
     Contains information about an element's layout, including position, size, and margins.
     """
-    
+
     # Default spacing constants
     DEFAULT_BLOCK_MARGIN = 20  # Increased spacing between block elements
     DEFAULT_HEADING_MARGIN = 24  # Larger spacing for headings
@@ -22,11 +26,14 @@ class LayoutBox:
     DEFAULT_FOOTER_MARGIN = 25  # Larger margin for footer elements
     DEFAULT_MARQUEE_MARGIN = 15  # Margin for marquee elements
     DEFAULT_COPYRIGHT_MARGIN = 20  # Margin for copyright elements
-    
+
+    # Global custom properties manager
+    _custom_properties = CSSCustomProperties()
+
     def __init__(self, element=None, display: str = 'block', parent=None):
         """
         Initialize a layout box.
-        
+
         Args:
             element: The DOM element
             display: Initial display property
@@ -39,6 +46,7 @@ class LayoutBox:
         self.display = display
         self.box_metrics = BoxMetrics()
         self.z_index = 0  # Default z-index
+        self._inherited_custom_properties: Dict[str, str] = {}  # Inherited CSS variables
         
         # Set default margins based on element type
         if element and hasattr(element, 'tag_name'):
@@ -126,35 +134,57 @@ class LayoutBox:
     def compute_styles(self, parent_styles: Dict[str, str] = None) -> None:
         """
         Compute styles for this layout box and its children.
-        
+
         Args:
             parent_styles: Inherited styles from parent element
         """
         if parent_styles is None:
             parent_styles = {}
-        
+
+        # Get custom properties manager
+        custom_props = get_custom_properties()
+
         # Inherit parent styles for relevant properties
         inherited_properties = [
             'color', 'font-family', 'font-size', 'font-weight', 'line-height',
             'text-align', 'text-indent', 'visibility'
         ]
-        
+
         self.computed_style = {}
-        
+
         # Inherit styles from parent
         for prop in inherited_properties:
             if prop in parent_styles:
                 self.computed_style[prop] = parent_styles[prop]
-        
+
         # Apply element's own styles if it has any
         if self.element and hasattr(self.element, 'style'):
+            element_id = id(self.element) if self.element else 0
+
+            # First, extract and store any custom properties (--name: value)
+            for prop, value in list(self.element.style.items()):
+                if custom_props.is_custom_property(prop):
+                    custom_props.set_property(element_id, prop, value)
+                    # Store inherited custom properties
+                    self._custom_properties[prop] = value
+
+            # Then apply regular styles, resolving var() references
+            inherited_custom = parent_styles.get('_custom_properties', {})
             for prop, value in self.element.style.items():
-                self.computed_style[prop] = value
-        
+                if not custom_props.is_custom_property(prop):
+                    # Resolve any var() references in the value
+                    resolved_value = custom_props.resolve_var(
+                        value, element_id, {**inherited_custom, **self._custom_properties}
+                    )
+                    self.computed_style[prop] = resolved_value
+
+        # Store custom properties for children to inherit
+        self.computed_style['_custom_properties'] = self._custom_properties
+
         # Update display property from computed styles
         if 'display' in self.computed_style:
             self.display = self.computed_style['display']
-        
+
         # Process z-index
         if 'z-index' in self.computed_style:
             try:
@@ -165,10 +195,10 @@ class LayoutBox:
         elif self.parent:
             # Inherit parent's z-index for stacking context
             self.z_index = self.parent.z_index
-        
+
         # Compute box metrics based on styles
         self._compute_box_metrics()
-        
+
         # Recursively compute styles for children
         for child in self.children:
             child.compute_styles(self.computed_style)
@@ -384,40 +414,29 @@ class LayoutBox:
             except ValueError:
                 return 0
         
-        # Handle calc() expressions
-        if value.startswith('calc(') and value.endswith(')'):
+        # Handle CSS math functions: calc(), min(), max(), clamp()
+        if any(value.startswith(fn) for fn in ('calc(', 'min(', 'max(', 'clamp(')):
             try:
-                # Extract the expression inside calc()
-                expr = value[5:-1].strip()
-                # For now, handle simple arithmetic with px and %
-                # This is a simplified version - in a real browser, we'd need a full CSS calc() parser
-                if '+' in expr:
-                    parts = expr.split('+')
-                    total = 0
-                    for part in parts:
-                        total += self._parse_dimension_value(part.strip())
-                    return total
-                elif '-' in expr:
-                    parts = expr.split('-')
-                    total = self._parse_dimension_value(parts[0].strip())
-                    for part in parts[1:]:
-                        total -= self._parse_dimension_value(part.strip())
-                    return total
-                elif '*' in expr:
-                    parts = expr.split('*')
-                    total = 1
-                    for part in parts:
-                        total *= self._parse_dimension_value(part.strip())
-                    return total
-                elif '/' in expr:
-                    parts = expr.split('/')
-                    total = self._parse_dimension_value(parts[0].strip())
-                    for part in parts[1:]:
-                        divisor = self._parse_dimension_value(part.strip())
-                        if divisor != 0:
-                            total /= divisor
-                    return int(total)
-            except Exception:
+                from ..css.value_functions import get_value_functions
+                vf = get_value_functions()
+                # Set current context
+                vf.set_viewport(self.viewport_width, self.viewport_height)
+                if self.parent:
+                    parent_font_size = self._parse_dimension_value(
+                        self.parent.computed_style.get('font-size', '16px')
+                    )
+                    if isinstance(parent_font_size, str):
+                        parent_font_size = 16
+                    vf.set_parent_font_size(parent_font_size)
+                # Resolve the function
+                resolved = vf.resolve_functions(value)
+                # Parse the resolved pixel value
+                if resolved.endswith('px'):
+                    return int(float(resolved[:-2]))
+                else:
+                    return int(float(resolved))
+            except Exception as e:
+                logger.debug(f"Error resolving CSS function {value}: {e}")
                 return 0
         
         # Handle unitless values as pixels

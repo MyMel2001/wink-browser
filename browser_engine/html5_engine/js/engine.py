@@ -1614,24 +1614,23 @@ class JSEngine:
     def setup_document(self, document) -> None:
         """
         Set up the JavaScript document object to reflect the DOM.
-        
+
         Args:
             document: The HTML document
         """
         if not document:
             logger.warning("Cannot setup document: document is None")
             return
-        
-        # Set document properties
-        if hasattr(document, 'title'):
-            self.interpreter.evaljs(f'document.title = "{document.title}";')
-        
-        # Set document readyState to 'interactive'
-        self.interpreter.evaljs('document.readyState = "interactive";')
-        
-        # In a real implementation, would create the full DOM API and bind elements
-        # For now, just set up a basic document object
-        
+
+        # Use the DOM bridge for proper DOM-JS integration
+        from .dom_bridge import DOMBridge
+
+        if not hasattr(self, '_dom_bridge'):
+            self._dom_bridge = DOMBridge(self.interpreter, document)
+            self._dom_bridge.register_python_callbacks()
+
+        self._dom_bridge.setup_document(document)
+
         # Dispatch DOMContentLoaded event
         self.interpreter.evaljs("""
         if (typeof window.addEventListener === 'function') {
