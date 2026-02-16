@@ -321,9 +321,14 @@ class BrowserWindow:
         if tab_id not in self.tabs:
             return
 
-        # Update previous tab's appearance
+        # Save current tab's state before switching
         if self.active_tab_id is not None and self.active_tab_id in self.tabs:
             old_tab = self.tabs[self.active_tab_id]
+            # Save document and layout state
+            old_tab.document = self.html5_engine.document
+            if hasattr(self.html5_engine, 'layout_tree'):
+                old_tab.layout_tree = self.html5_engine.layout_tree
+            # Update old tab's appearance
             if hasattr(old_tab, 'label') and old_tab.label:
                 old_tab.label.configure(style='Tab.TLabel')
 
@@ -448,9 +453,57 @@ class BrowserWindow:
 
     def _load_url_in_tab_thread(self, tab_id: int, url: str) -> None:
         """Load a URL in a tab in a background thread."""
-        # This is a simplified version - full implementation would
-        # use the HTML5 engine to load the page
-        pass
+        if tab_id not in self.tabs:
+            return
+
+        tab = self.tabs[tab_id]
+
+        try:
+            # Apply ad blocker if enabled
+            processed_url = self.ad_blocker.process_url(url) if self.ad_blocker else url
+
+            # Create a temporary engine to load the page
+            # This avoids overwriting the active tab's content
+            temp_engine = HTML5Engine(
+                width=self.html5_engine.width,
+                height=self.html5_engine.height,
+                debug=self.html5_engine.debug
+            )
+
+            # Load the URL
+            success = temp_engine.load_url(processed_url)
+
+            if success and temp_engine.document:
+                # Store the loaded content in the tab
+                tab.document = temp_engine.document
+                if hasattr(temp_engine, 'layout_tree'):
+                    tab.layout_tree = temp_engine.layout_tree
+                tab.is_loading = False
+
+                # Get the title
+                if hasattr(temp_engine.document, 'title') and temp_engine.document.title:
+                    tab.title = temp_engine.document.title
+                    # Update tab label on main thread
+                    self.root.after(0, lambda t=tab_id, title=tab.title: self._update_tab_title(t, title))
+                else:
+                    # Use URL as title
+                    tab.title = url.split('/')[-1] or url
+                    self.root.after(0, lambda t=tab_id, title=tab.title: self._update_tab_title(t, title))
+
+                # If this is now the active tab, render the content
+                if tab_id == self.active_tab_id:
+                    self.root.after(0, lambda: self._render_tab_content(self.tabs.get(tab_id)))
+
+                logger.info(f"Background tab {tab_id} loaded: {url}")
+            else:
+                logger.error(f"Failed to load background tab {tab_id}: {url}")
+                tab.is_loading = False
+                tab.title = "Failed to load"
+                self.root.after(0, lambda t=tab_id: self._update_tab_title(t, "Failed to load"))
+
+        except Exception as e:
+            logger.error(f"Error loading background tab {tab_id}: {e}")
+            tab.is_loading = False
 
     def _update_tab_title(self, tab_id: int, title: str) -> None:
         """Update the title of a specific tab."""
@@ -827,7 +880,7 @@ class BrowserWindow:
     def navigate_to_url(self, url: str) -> None:
         """
         Navigate to the specified URL.
-        
+
         Args:
             url: URL to navigate to
         """
@@ -837,36 +890,41 @@ class BrowserWindow:
             logger.error(error_message)
             self.status_label.config(text=f"Error: {error_message}")
             return
-            
+
         # Normalize and validate URL
         url_obj = URL(url, base_url=self.current_url)
         normalized_url = url_obj.normalized
-        
+
         # Update address bar
         self.url_var.set(normalized_url)
-        
+
         # Update status
         self.status_label.config(text=f"Loading {normalized_url}...")
         self.progress_var.set(20)
         self.is_loading = True
-        
+
         # Change refresh button to stop button during loading
         self.refresh_button.config(text="✕")
-        
-        # Update history if this is a new navigation (not back/forward)
+
+        # Update tab-specific history for the active tab
+        if self.active_tab_id is not None and self.active_tab_id in self.tabs:
+            tab = self.tabs[self.active_tab_id]
+            tab.add_to_history(normalized_url)
+            tab.url = normalized_url
+            tab.is_loading = True
+
+        # Also update global history (for backward compatibility)
         if self.current_history_index == len(self.history) - 1:
-            # Add to history
             self.history.append(normalized_url)
             self.current_history_index += 1
         elif self.current_history_index < len(self.history) - 1:
-            # Navigating after using back button, remove forward history
             self.history = self.history[:self.current_history_index + 1]
             self.history.append(normalized_url)
             self.current_history_index += 1
-        
+
         # Update navigation buttons
         self._update_navigation_state()
-        
+
         # Set current URL
         self.current_url = normalized_url
         
@@ -942,10 +1000,27 @@ class BrowserWindow:
                 
             # Update progress
             self.root.after(0, lambda: self.progress_var.set(100))
-            
+
             # Update renderer
             self.root.after(0, lambda: self._update_renderer())
-            
+
+            # Save content to the active tab
+            if self.active_tab_id is not None and self.active_tab_id in self.tabs:
+                tab = self.tabs[self.active_tab_id]
+                tab.document = self.html5_engine.document
+                if hasattr(self.html5_engine, 'layout_tree'):
+                    tab.layout_tree = self.html5_engine.layout_tree
+                tab.is_loading = False
+
+                # Update tab title
+                if hasattr(self.html5_engine.document, 'title') and self.html5_engine.document.title:
+                    tab.title = self.html5_engine.document.title
+                    self.root.after(0, lambda t=self.active_tab_id, title=tab.title: self._update_tab_title(t, title))
+                else:
+                    # Use URL as title
+                    tab.title = url.split('/')[-1] or url
+                    self.root.after(0, lambda t=self.active_tab_id, title=tab.title: self._update_tab_title(t, title))
+
             # Cache content if not in private mode and not a special URL
             if not self.private_mode and not url_obj.is_special:
                 self.content_cache[url] = {

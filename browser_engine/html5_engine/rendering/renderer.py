@@ -1573,16 +1573,16 @@ class HTML5Renderer:
     def _load_image_in_background(self, src):
         """
         Load an image in the background.
-        
+
         Args:
             src: Image source URL
         """
         try:
-            # Try to load the image
-            image_data = self._get_image(src)
+            # Try to load the image synchronously (we're in a background thread)
+            image_data = self._get_image(src, async_mode=False)
             if image_data:
-                # Schedule a redraw
-                if hasattr(self, 'canvas'):
+                # Schedule a redraw on the main thread
+                if hasattr(self, 'canvas') and self.canvas:
                     self.canvas.after(100, self._redraw_images, src)
         except Exception as e:
             logger.error(f"Error loading image in background: {e}")
@@ -1605,56 +1605,85 @@ class HTML5Renderer:
             self._render_element(self.layout_tree, 0, 0)
             self._update_scroll_region()
     
-    def _get_image(self, src):
+    def _get_image(self, src, async_mode=True):
         """
         Get an image from a source URL.
-        
+
         Args:
             src (str): The source URL of the image.
-            
+            async_mode (bool): If True, non-cached remote images will be loaded asynchronously.
+
         Returns:
-            PIL.Image.Image: The image object, or None if the image could not be loaded.
+            PIL.Image.Image: The image object, or None if not in cache and async_mode is True.
         """
         if not src:
             return None
-            
+
         logger.info(f"Attempting to load image from source: {src}")
-        
-        # Check image cache first
+
+        # Check image cache first - always return cached images immediately
         if src in self.image_cache:
             logger.info(f"Found image in cache: {src}")
             return self.image_cache[src]
-        
-        try:
-            # Handle data URLs
-            if src.startswith('data:image'):
-                try:
-                    # Extract the base64 data
-                    header, encoded = src.split(',', 1)
-                    import base64
-                    from io import BytesIO
 
-                    # Check if it's an SVG
-                    is_svg = 'svg+xml' in header.lower()
-                    
-                    # Decode the image data
-                    decoded = base64.b64decode(encoded)
-                    
-                    if is_svg:
-                        # Convert SVG to PNG using cairosvg
+        # Handle data URLs synchronously (fast, inline data)
+        if src.startswith('data:image'):
+            try:
+                header, encoded = src.split(',', 1)
+                is_svg = 'svg+xml' in header.lower()
+                decoded = base64.b64decode(encoded)
+
+                if is_svg:
+                    try:
                         import cairosvg
                         png_data = cairosvg.svg2png(bytestring=decoded)
                         image = Image.open(BytesIO(png_data))
+                    except Exception as e:
+                        logger.warning(f"cairosvg not available for SVG: {e}")
+                        return None
+                else:
+                    image = Image.open(BytesIO(decoded))
+
+                self.image_cache[src] = image
+                return image
+            except Exception as e:
+                logger.error(f"Failed to decode data URL: {e}")
+                return None
+
+        # Handle local file URLs synchronously (fast)
+        if src.startswith('file://') or (not src.startswith(('http://', 'https://')) and os.path.exists(src)):
+            try:
+                path = src.replace('file://', '') if src.startswith('file://') else src
+                if os.path.exists(path):
+                    with open(path, 'rb') as f:
+                        image_data = f.read()
+
+                    is_svg = path.lower().endswith('.svg')
+                    if is_svg:
+                        try:
+                            import cairosvg
+                            png_data = cairosvg.svg2png(bytestring=image_data)
+                            image = Image.open(BytesIO(png_data))
+                        except Exception as e:
+                            logger.warning(f"cairosvg not available for SVG: {e}")
+                            return None
                     else:
-                        # For regular images, use the decoded data
-                        image = Image.open(BytesIO(decoded))
-                    
-                    # Cache and return the image regardless of format
+                        image = Image.open(BytesIO(image_data))
+
                     self.image_cache[src] = image
                     return image
-                except Exception as e:
-                    logger.error(f"Failed to decode data URL: {e}")
-                    return None
+            except Exception as e:
+                logger.error(f"Failed to load local image: {e}")
+                return None
+
+        # For remote URLs, start async loading if in async mode
+        if async_mode and src.startswith(('http://', 'https://')):
+            logger.info(f"Image not cached, starting async load: {src}")
+            self._start_image_loading(src)
+            return None
+
+        # Fallback: try synchronous loading for relative paths and other cases
+        try:
                     
             # Get base URL - try multiple sources to ensure we get the correct one
             # Initialize base_url
